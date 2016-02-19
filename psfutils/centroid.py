@@ -71,7 +71,6 @@ def local_centroid(data, mode='jay', max_position=None):
     elif mode == '1d':
         xc = _1d_local_centroid1d(xdata, submin=False)
         yc = _1d_local_centroid1d(ydata, submin=False)
-
     elif mode == '1dsubmin':
         xc = _1d_local_centroid1d(xdata, submin=True)
         yc = _1d_local_centroid1d(ydata, submin=True)
