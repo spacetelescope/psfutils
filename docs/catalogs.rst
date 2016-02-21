@@ -2,10 +2,8 @@
 Functions for reading user source catalogs and extracting cutouts from images.
 ******************************************************************************
 
-.. moduleauthor:: Mihai Cara <help@stsci.edu>
+.. currentmodule:: psfutils.catalogs
 
-.. currentmodule:: epsf.catalogs
-
-.. automodule:: epsf.catalogs
+.. automodule:: psfutils.catalogs
    :members:
 ..   :undoc-members:

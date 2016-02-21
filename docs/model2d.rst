@@ -2,9 +2,7 @@
 2D Discrete Fittable Model.
 ***************************
 
-.. moduleauthor:: Mihai Cara <help@stsci.edu>
+.. currentmodule:: psfutils.model2d
 
-.. currentmodule:: epsf.model2d
-
-.. automodule:: epsf.model2d
+.. automodule:: psfutils.model2d
    :members:

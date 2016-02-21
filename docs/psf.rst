@@ -2,10 +2,8 @@
 PSF building, resampling, and fitting tools.
 ********************************************
 
-.. moduleauthor:: Mihai Cara <help@stsci.edu>
+.. currentmodule:: psfutils.psf
 
-.. currentmodule:: epsf.psf
-
-.. automodule:: epsf.psf
+.. automodule:: psfutils.psf
    :members:
 ..   :undoc-members:
