@@ -269,6 +269,8 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
         center appears to be outside the model's image.
 
     """
+    # TODO: Allow passing kwargs to fitter
+    #
     if hasattr(stars, '__iter__'):
         nstars = len(stars)
     else:
@@ -278,16 +280,11 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
     if nstars == 0:
         return []
 
-    if flux0 is None:
-        flux0 = [s.flux.value for s in stars]
-    else:
-        if len(flux0) != nstars:
-            raise ValueError("'flux0' must have the same number of elements as "
-                             "the number of input stars")
-
     # analize fitbox:
-    minfbx = min([s.nx for s in stars])
-    minfby = min([s.ny for s in stars])
+    snx = [s.nx for s in stars]
+    sny = [s.ny for s in stars]
+    minfbx = min(snx)
+    minfby = min(sny)
     if fitbox is None:
         # use full grid defined by stars' data size:
         fitbox = (minfbx, minfby)
@@ -308,13 +305,27 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
     # oversampling:
     oversampling = _parse_oversampling(oversampling, nstars)
 
+    # initial fluxes for the fitted PSF:
+    if flux0 is None:
+        flux0 = [s.flux.value for s in stars]
+    else:
+        if len(flux0) != nstars:
+            raise ValueError("'flux0' must have the same number of elements as "
+                             "the number of input stars")
+
     # create grid for fitting box (in stars' grid units):
     width, height = fitbox
     width = int(round(width))
     height = int(round(height))
-    xv = np.arange(width, dtype=np.float) - (width - 1) // 2
-    yv = np.arange(height, dtype=np.float) - (height - 1) // 2
+    xv = np.arange(width, dtype=np.float)
+    yv = np.arange(height, dtype=np.float)
     igx, igy = np.meshgrid(xv, yv)
+
+    # create grid for flux evaluation:
+    maxsnx = max(snx)
+    maxsny = max(sny)
+    sgx, sgy = np.meshgrid(np.arange(maxsnx, dtype=np.float),
+                           np.arange(maxsny, dtype=np.float))
 
     # perform fitting for each star:
     fitted_stars = []
@@ -327,6 +338,7 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
     for st, f0, ov in zip(stars, flux0, oversampling):
         err = 0
         ovx, ovy = ov
+        ny, nx = st.shape
 
         sxc = st.ox + st.dx.value
         syc = st.oy + st.dy.value
@@ -345,9 +357,9 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
             x1 = 0
         else:
             i1 = 0
-        if x2 > st.nx:
-            i2 = width - (x2 - st.nx)
-            x2 = st.nx
+        if x2 > nx:
+            i2 = width - (x2 - nx)
+            x2 = nx
         else:
             i2 = width
         if y1 < 0:
@@ -355,18 +367,18 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
             y1 = 0
         else:
             j1 = 0
-        if y2 > st.ny:
-            j2 = height - (y2 - st.ny)
-            y2 = st.ny
+        if y2 > ny:
+            j2 = height - (y2 - ny)
+            y2 = ny
         else:
             j2 = height
 
-        if rxc < 0 or rxc > (st.nx - 1) or ryc < 0 or ryc > (st.ny - 1):
+        if rxc < 0 or rxc > (nx - 1) or ryc < 0 or ryc > (ny - 1):
             # star's center is outside the extraction box
             err = 1
             fit_info = None
             fitted_psf = psf.copy()
-            fitted_psf.flux = st.flux.value
+            fitted_psf.flux = f0
             warnings.warn("Source with coordinates ({}, {}) is being ignored "
                           "because its center pixel is outside the image."
                           .format(st.ox, st.oy))
@@ -376,18 +388,20 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
             err = 2
             fit_info = None
             fitted_psf = psf.copy()
-            fitted_psf.flux = st.flux.value
+            fitted_psf.flux = f0
             warnings.warn("Source with coordinates ({}, {}) is being ignored "
                           "because there are too few pixels available around "
                           "its center pixel.".format(st.ox, st.oy))
 
         else:
             # define PSF sampling grid:
-            gx = ((rxc - sxc) * ovx) + igx[j1:j2, i1:i2] * ovx
-            gy = ((ryc - syc) * ovy) + igy[j1:j2, i1:i2] * ovy
+            gx = (igx[j1:j2, i1:i2] - (sxc - x1)) * ovx
+            gy = (igy[j1:j2, i1:i2] - (syc - y1)) * ovy
 
             # initial guess for fitted flux:
-            psf.flux = f0
+            psf.flux = 1.0
+            psf.flux = f0 / np.sum(psf((sgx[:ny, :nx] - sxc) * ovx,
+                                       (sgy[:ny, :nx] - syc) * ovy))
 
             # fit PSF to the star:
             if st.weights is None:
@@ -407,16 +421,24 @@ def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
         cst.dy -= fitted_psf.dy.value / ovy
         cst.recenter()
 
+        # reset "shift" of the fitted PSF:
+        fitted_psf.dx = 0
+        fitted_psf.dy = 0
+
+        # compute "measured" star's flux based on fitted ePSF:
+        fitted_flux = np.sum(fitted_psf((sgx[:ny, :nx] - cst.ox) * ovx,
+                                        (sgy[:ny, :nx] - cst.oy) * ovy))
+
         if residuals:
             # it is important to compute residuals *before* flux of the 'cst'
             # is updated with fitted PSF estimate:
-            res.append(_calc_res(fitted_psf, cst, ovx, ovy))
+            res.append(_calc_res(fitted_psf, cst, ovx, ovy, fitted_flux))
 
         if update_flux:
-            cst.flux = fitted_psf.flux.value
+            cst.flux = fitted_flux
         fitted_stars.append(cst)
 
-        fitted_fluxes.append(fitted_psf.flux.value)
+        fitted_fluxes.append(fitted_flux)
 
         if add_fit_info:
             fi.append(fit_info)
@@ -547,7 +569,7 @@ def iter_build_psf(stars, psf_shape=None, oversampling=1.0, degree=3,
 
     if residuals:
         res = compute_residuals(
-            psf, stars, oversampling, fitted_psf_fluxes=fluxes
+            psf, stars, oversampling, fitted_fluxes=fluxes
         )
     else:
         res = None
@@ -735,15 +757,15 @@ def find_peak(image_data, xmax=None, ymax=None, w=3):
     return coord
 
 
-def _calc_res(psf, star, ovx, ovy):
-    xv = ovx * np.arange(star.nx, dtype=np.float) - ovx * star.ox
-    yv = ovy * np.arange(star.ny, dtype=np.float) - ovy * star.oy
-    igx, igy = np.meshgrid(xv, yv)
-    psf_star = psf(igx, igy)
-    return (star.data - psf_star)
+def _calc_res(psf, star, ovx, ovy, fitted_flux):
+    xv = ovx * (np.arange(star.nx, dtype=np.float) - (star.ox + star.dx.value))
+    yv = ovy * (np.arange(star.ny, dtype=np.float) - (star.oy + star.dy.value))
+    gx, gy = np.meshgrid(xv, yv)
+    psf_star = psf(gx, gy)
+    return (star.data - fitted_flux * psf_star / np.sum(psf_star))
 
 
-def compute_residuals(psf, stars, oversampling, fitted_psf_fluxes=None):
+def compute_residuals(psf, stars, oversampling, fitted_fluxes=None):
     """
     Register the `psf` to intput `stars` and compute the difference.
 
@@ -771,7 +793,7 @@ def compute_residuals(psf, stars, oversampling, fitted_psf_fluxes=None):
         also possible to have individualized oversampling factors for each star
         by providing a list of integers or tuples of integers.
 
-    fitted_psf_fluxes : list of float, None, optional
+    fitted_fluxes : list of float, None, optional
         Fluxes that should be used to scale the input `psf`. The list must be
         of the same length as the length of `stars`. If not provided,
         flux of the stars will be used for scaling the PSF.
@@ -784,13 +806,11 @@ def compute_residuals(psf, stars, oversampling, fitted_psf_fluxes=None):
     """
     nstars = len(stars)
     oversampling = _parse_oversampling(oversampling, nstars)
-    psf = psf.copy()
     res = []
-    if fitted_psf_fluxes is None:
-        fitted_psf_fluxes = [s.flux.value for s in stars]
-    for s, (ovx, ovy), flux in zip(stars, oversampling, fitted_psf_fluxes):
-        psf.flux = flux
-        res.append(_calc_res(psf, s, ovx, ovy))
+    if fitted_fluxes is None:
+        fitted_fluxes = [s.flux.value for s in stars]
+    for s, (ovx, ovy), flux in zip(stars, oversampling, fitted_fluxes):
+        res.append(_calc_res(psf, s, ovx, ovy, flux))
     return res
 
 

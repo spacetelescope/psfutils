@@ -14,9 +14,9 @@ from .psf import find_peak
 __all__ = ['extract_stars']
 
 
-def extract_stars(catalog, image, ext, weights=None, wext=0,
-                  extract_size=11, minmag=None, maxpixval=None,
-                  recenter=None):
+def extract_stars(catalog, image, ext=0, weights=None, wext=0,
+                  origin=1, extract_size=11, minmag=None, maxpixval=None,
+                  recenter=False):
     """Extracts subimages centered on stars from a catalog.
 
     Given an input catalog of source coordinates in an image, the image and
@@ -38,7 +38,7 @@ def extract_stars(catalog, image, ext, weights=None, wext=0,
         A 2D :py:class:`numpy.ndarray` or the name of a FITS file containing
         a 2D image.
 
-    ext : int, tuple
+    ext : int, tuple, optional
         Extension number or a tuple of extension name and extension version
         indicating the extension in the FITS file given by `image` that
         contains the image. This parameter is ignored if `image` is
@@ -54,6 +54,11 @@ def extract_stars(catalog, image, ext, weights=None, wext=0,
         indicating the extension in the FITS file given by `weights` that
         contains the image of weights. This parameter is ignored if `weights`
         is a :py:class:`numpy.ndarray`.
+
+    origin : int, optional
+        Origin of the coordinates of sources listed in the `catalog`. If
+        coordinates follow FITS convention, `origin` should be 1 (and 0 if
+        using numpy convention).
 
     extract_size : int, tuple, numpy.ndarray, optional
         Indicates the size of the extraction region for each source. If a
@@ -109,7 +114,7 @@ def extract_stars(catalog, image, ext, weights=None, wext=0,
         catalog = np.loadtxt(catalog)
 
     # change the origin of coordinates from 1 (FITS) to 0 (numpy.ndarray):
-    image[:, :2] -= 1
+    catalog[:, :2] -= origin
 
     # process extraction region size:
     bsize = np.zeros((catalog.shape[0], 2), dtype=np.int)
