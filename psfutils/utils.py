@@ -1,5 +1,6 @@
-from __future__ import absolute_import, division, unicode_literals, \
-     print_function
+
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import logging
 import numpy as np
@@ -7,6 +8,7 @@ from scipy import interpolate
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler(level=logging.INFO))
+
 
 __all__ = ['py2round', 'interpolate_missing_data']
 

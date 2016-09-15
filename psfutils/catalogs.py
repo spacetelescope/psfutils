@@ -1,9 +1,9 @@
 """
 This module provides tools for source extraction from images and catalogs.
-
 """
-from __future__ import absolute_import, division, unicode_literals, \
-     print_function
+
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import copy
 import logging

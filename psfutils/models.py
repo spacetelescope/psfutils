@@ -1,8 +1,9 @@
 """
 This module provides fittable models based on 2D images.
 """
-from __future__ import absolute_import, division, unicode_literals,\
-     print_function
+
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import warnings
 import logging

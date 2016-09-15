@@ -1,10 +1,10 @@
 """
 This module provides tools for creation and fitting of empirical PSFs (ePSF)
 to stars.
-
 """
-from __future__ import absolute_import, division, unicode_literals, \
-     print_function
+
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import logging
 import warnings
