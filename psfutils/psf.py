@@ -1,59 +1,204 @@
 """
 This module provides tools for creation and fitting of empirical PSFs (ePSF)
 to stars.
+
 """
 from __future__ import absolute_import, division, unicode_literals, \
      print_function
 
+import logging
 import warnings
+import copy
 import numpy as np
-from astropy.convolution import convolve
-from astropy.modeling.polynomial import Polynomial2D
+
+from astropy.convolution import convolve, Kernel
 from astropy.modeling import fitting
+from astropy.modeling.parameters import Parameter
 
-from .model2d import Discrete2DModel
+from .centroid import find_peak
+from .models import FittableImageModel2D, NonNormalizable
+from .catalogs import Star
+from .utils import py2round, interpolate_missing_data
 
-__all__ = ['psf_from_stars', 'fit_stars', 'find_peak', 'iter_build_psf',
+__all__ = ['PSF2DModel', 'build_psf', 'iter_build_psf', 'fit_stars',
            'compute_residuals']
 
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler(level=logging.INFO))
+
+
 _kernel_quar = np.array(
-    [[ 0.041632, -0.080816,  0.078368, -0.080816,  0.041632],
-     [-0.080816, -0.019592,  0.200816, -0.019592, -0.080816],
-     [ 0.078368,  0.200816,  0.441632,  0.200816,  0.078368],
-     [-0.080816, -0.019592,  0.200816, -0.019592, -0.080816],
-     [ 0.041632, -0.080816,  0.078368, -0.080816,  0.041632]]
+    [[+0.041632, -0.080816, 0.078368, -0.080816, +0.041632],
+     [-0.080816, -0.019592, 0.200816, -0.019592, -0.080816],
+     [+0.078368, +0.200816, 0.441632, +0.200816, +0.078368],
+     [-0.080816, -0.019592, 0.200816, -0.019592, -0.080816],
+     [+0.041632, -0.080816, 0.078368, -0.080816, +0.041632]]
 )
 
 _kernel_quad = np.array(
-    [[-0.07428311,  0.01142786,  0.03999952,  0.01142786, -0.07428311],
-     [ 0.01142786,  0.09714283,  0.12571449,  0.09714283,  0.01142786],
-     [ 0.03999952,  0.12571449,  0.15428215,  0.12571449,  0.03999952],
-     [ 0.01142786,  0.09714283,  0.12571449,  0.09714283,  0.01142786],
-     [-0.07428311,  0.01142786,  0.03999952,  0.01142786, -0.07428311]]
+    [[-0.07428311, 0.01142786, 0.03999952, 0.01142786, -0.07428311],
+     [+0.01142786, 0.09714283, 0.12571449, 0.09714283, +0.01142786],
+     [+0.03999952, 0.12571449, 0.15428215, 0.12571449, +0.03999952],
+     [+0.01142786, 0.09714283, 0.12571449, 0.09714283, +0.01142786],
+     [-0.07428311, 0.01142786, 0.03999952, 0.01142786, -0.07428311]]
 )
 
 
-def psf_from_stars(stars, shape=None, oversampling=1.0, degree=3,
-                   stat='mean', nclip=0, lsig=3.0, usig=3.0, ker=None):
-    """
-    Register multiple stars into a single oversampled grid to create an ePSF.
+class PSF2DModel(FittableImageModel2D):
+    """ A subclass of `~psfutils.models.FittableImageModel2D` that adds the
+    ``pixel_scale`` attribute so that oversampling factor can be computed from
+    scales of stars.
 
+    .. note::
+
+        If this class is subclassed in order to override the
+        :py:func:`~psfutils.FittableImageModel2D.compute_interpolator()`
+        method of the :py:class:`psfutils.FittableImageModel2D` class, then,
+        depending on the properties of the new interpolator, one may need
+        to override the :py:func:`~psfutils.FittableImageModel2D.evaluate`
+        method as well. In particular, it is important that a custom
+        interpolator's evaluation function accepts 2D `~numpy.ndarray`
+        for coordinate arguments.
+
+    """
+    def __init__(self, data, flux=1.0, x_0=0, y_0=0, origin=None,
+                 normalize=True, correction_factor=1.0, fill_value=0.0,
+                 ikwargs={}, pixel_scale=1, peak_fit_box=5,
+                 peak_search_box=None, recenter_accuracy=1.0e-4,
+                 recenter_nmax=1000):
+        """
+        :py:class:`PSF2DModel`'s initializer has almost the same parameters
+        as the :py:class:`psfutils.FittableImageModel2D` initializer.
+        Therefore here we document only the differences.
+
+        Parameters
+        ----------
+        pixel_scale : float, optional
+            Pixel scale (in arbitrary units) of model's image. Either a single
+            floating point value or a 1D iterable of length at least 2
+            (x-scale, y-scale) can be provided.
+
+        """
+        super(PSF2DModel, self).__init__(
+            data=data,
+            flux=flux,
+            x_0=x_0,
+            y_0=y_0,
+            origin=origin,
+            normalize=normalize,
+            correction_factor=correction_factor,
+            fill_value=fill_value,
+            ikwargs=ikwargs
+        )
+        self._pixscale = pixel_scale
+
+    @property
+    def pixel_scale(self):
+        """ Set/Get pixel scale (in arbitrary units). Either a single floating
+        point value or a 1D iterable of length at least 2 (x-scale, y-scale)
+        can be provided. When getting pixel scale, a tuple of two values is
+        returned with a pixel scale for each axis.
+
+        """
+        return self._pixscale
+
+    @pixel_scale.setter
+    def pixel_scale(self, pixel_scale):
+        if hasattr(pixel_scale, '__iter__'):
+            if len(pixel_scale) != 2:
+                raise TypeError("Parameter 'pixel_scale' must be either a "
+                                "scalar or an iterable with two elements.")
+            self._pixscale = (float(pixel_scale[0]), float(pixel_scale[1]))
+        else:
+            self._pixscale = (float(pixel_scale), float(pixel_scale))
+
+    def make_similar_from_data(self, data, origin=None):
+        """
+        This method creates a new model initialized with the same
+        settings as the current object except for the ``origin`` and
+        model parameters from input data.
+
+        **IMPORTANT:** Model parameters of the new model will be set to default
+        values.
+
+        This method may need to be overriden in a subclass to take into account
+        additional settings that may be present in subclass' initializer.
+
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Array containing 2D image.
+
+        origin : tuple, None, optional
+            A reference point in the input image ``data`` array. See
+            :py:class:`~PSF2DModel` for more details.
+
+            The *only difference* here is the behavior when ``origin``
+            is `None`. In this case:
+
+            * if input ``data`` has the same shape as the shape as the
+              current object, then origin will be set to the same value as in
+              the current object;
+
+            * if input ``data`` has a shape different from the shape of the
+              current object, then the origin of the new object will be set
+              at the center of the image array.
+
+
+        Returns
+        -------
+        new_model : PSF2DModel
+            A new `PSF2DModel` constructed from new data using
+            same settings as the current object except for ``origin``
+            and model parameters.
+
+        """
+        data = np.asarray(data, dtype=np.float64)
+
+        if data.shape == self.shape:
+            origin = self.origin
+
+        new_model = PSF2DModel(
+            data=data,
+            flux=self.flux.default,
+            x_0=self.x_0.default,
+            y_0=self.y_0.default,
+            normalize=self.normalization_status != 2,
+            correction_factor=self.correction_factor,
+            origin=origin,
+            fill_value=self.fill_value,
+            ikwargs=self.interpolator_kwargs,
+            pixel_scale=self._pixscale
+        )
+
+        return new_model
+
+
+def init_psf(stars, shape=None, oversampling=4.0, pixel_scale=None,
+             psf_cls=PSF2DModel, **kwargs):
+    """
     Parameters
     ----------
-    stars : list of Discrete2DModel
-        A list of :py:class:`~psfutils.model2d.Discrete2DModel` objects
-        containing models of the stars that need to be combined into
-        a single oversampled PSF. Star registration relies on correct
-        coordinates of the centers of stars which must be set in the
-        :py:class:`~psfutils.model2d.Discrete2DModel.origin` property or,
-        alternatively, using model ``dx`` and ``dy`` parameters.
+    stars : Star, list of Star
+        A list of :py:class:`~psfutils.catalogs.Star` objects
+        containing image data of star cutouts that are used to "build" a PSF.
+
+    psf : PSF2DModel, type, None, optional
+        An existing approximation to the PSF which needs to be recomputed
+        using new ``stars`` (with new parameters for center and flux)
+        or a class indicating the type of the ``psf`` object to be created
+        (preferebly a subclass of :py:class:`PSF2DModel`).
+        If `psf` is `None`, a new ``psf`` will be computed using
+        :py:class:`PSF2DModel`.
 
     shape : tuple, optional
         Numpy-style shape of the output PSF. If shape is not specified (i.e.,
         it is set to `None`), the shape will be derived from the sizes of the
-        input star models.
+        input star models. This is ignored if `psf` is not `None`.
 
-    oversampling : float, tuple of float, list of (float, tuple of float), optional
+    oversampling : float, tuple of float, list of (float, tuple of float), \
+optional
         Oversampling factor of the PSF relative to star. It indicates how many
         times a pixel in the star's image should be sampled when creating PSF.
         If a single number is provided, that value will be used for both
@@ -63,10 +208,170 @@ def psf_from_stars(stars, shape=None, oversampling=1.0, degree=3,
         also possible to have individualized oversampling factors for each star
         by providing a list of integers or tuples of integers.
 
-    degree : int, tuple of int, optional
-        The degree of the interpolating spline. If a tuple is provided, the
-        first element of the tuple will indicate the degree along ``X`` axis
-        and the second element will indicate the degree along ``Y`` axis.
+    """
+    # check parameters:
+    if pixel_scale is None and oversampling is None:
+        raise ValueError(
+            "'oversampling' and 'pixel_scale' cannot be 'None' together. "
+            "At least one of these two parameters must be provided."
+        )
+
+    # get all stars including linked stars as a flat list:
+    all_stars = []
+    for s in stars:
+        all_stars += s.get_linked_list()
+
+    # find pixel scale:
+    if pixel_scale is None:
+        ovx, ovy = _parse_tuple_pars(oversampling, name='oversampling',
+                                     dtype=float)
+
+        # compute PSF's pixel scale as the smallest scale of the stars
+        # divided by the requested oversampling factor:
+        pscale_x, pscale_y = all_stars[0].pixel_scale
+        for s in all_stars[1:]:
+            px, py = s.pixel_scale
+            if px < pscale_x:
+                pscale_x = px
+            if py < pscale_y:
+                pscale_y = py
+
+        pscale_x /= ovx
+        pscale_y /= ovy
+
+    else:
+        pscale_x, pscale_y = _parse_tuple_pars(pixel_scale, name='pixel_scale',
+                                               dtype=float)
+
+    # if shape is None, find the minimal shape that will include input star's
+    # data:
+    if shape is None:
+        w = np.array([((s.x_center + 0.5) * s.pixel_scale[0] / pscale_x,
+                       (s.nx - s.x_center - 0.5) * s.pixel_scale[0] / pscale_x)
+                      for s in all_stars])
+        h = np.array([((s.y_center + 0.5) * s.pixel_scale[1] / pscale_y,
+                       (s.ny - s.y_center - 0.5) * s.pixel_scale[1] / pscale_y)
+                      for s in all_stars])
+
+        # size of the PSF in the input image pixels
+        # (the image with min(pixel_scale)):
+        nx = int(np.ceil(np.amax(w / ovx + 0.5)))
+        ny = int(np.ceil(np.amax(h / ovy + 0.5)))
+
+        # account for a maximum error of 1 pix in the initial star coordinates:
+        nx += 2
+        ny += 2
+
+        # convert to oversampled pixels:
+        nx = int(np.ceil(np.amax(nx * ovx + 0.5)))
+        ny = int(np.ceil(np.amax(ny * ovy + 0.5)))
+
+        # we prefer odd sized images
+        nx += 1 - nx % 2
+        ny += 1 - ny % 2
+        shape = (ny, nx)
+
+    else:
+        (ny, nx) = _parse_tuple_pars(shape, name='shape', dtype=int)
+
+    # center of the output grid:
+    cx = (nx - 1) / 2.0
+    cy = (ny - 1) / 2.0
+
+    with warnings.catch_warnings(record=False):
+        warnings.simplefilter("ignore", NonNormalizable)
+
+        # filter out parameters set by us:
+        kwargs = copy.deepcopy(kwargs)
+        for kw in ['data', 'origin', 'normalize', 'pixel_scale']:
+            if kw in kwargs:
+                del kwargs[kw]
+
+        data = np.zeros((ny, nx), dtype=np.float)
+        psf = psf_cls(
+            data=data, origin=(cx, cy), normalize=True,
+            pixel_scale=(pscale_x, pscale_y), **kwargs
+        )
+
+    return psf
+
+
+def build_psf(stars, psf=None, peak_fit_box=5, peak_search_box='fitbox',
+              recenter_accuracy=1.0e-4, recenter_nmax=1000,
+              ignore_badfit_stars=True,
+              stat='median', nclip=10, lsig=3.0, usig=3.0, ker='quar'):
+    """
+    Register multiple stars into a single oversampled grid to create an ePSF.
+
+    Parameters
+    ----------
+    stars : Star, list of Star
+        A list of :py:class:`~psfutils.catalogs.Star` objects
+        containing image data of star cutouts that are used to "build" a PSF.
+
+    psf : PSF2DModel, type, None, optional
+        An existing approximation to the PSF which needs to be recomputed
+        using new ``stars`` (with new parameters for center and flux)
+        or a class indicating the type of the ``psf`` object to be created
+        (preferebly a subclass of :py:class:`PSF2DModel`).
+        If ``psf`` is `None`, a new ``psf`` will be computed using
+        :py:class:`PSF2DModel`.
+
+    shape : tuple, optional
+        Numpy-style shape of the output PSF. If shape is not specified (i.e.,
+        it is set to `None`), the shape will be derived from the sizes of the
+        input star models. This is ignored if ``psf`` is not `None`.
+
+    oversampling : float, tuple of float, list of (float, tuple of float), \
+optional
+        Oversampling factor of the PSF relative to star. It indicates how many
+        times a pixel in the star's image should be sampled when creating PSF.
+        If a single number is provided, that value will be used for both
+        ``X`` and ``Y`` axes and for all stars. When a tuple is provided,
+        first number will indicate oversampling along the ``X`` axis and the
+        second number will indicate oversampling along the ``Y`` axis. It is
+        also possible to have individualized oversampling factors for each star
+        by providing a list of integers or tuples of integers.
+
+    peak_fit_box : int, tuple of int, optional
+        Size (in pixels) of the box around the ``origin`` (or around PSF's peak
+        if peak was searched for - see ``peak_search_box`` for more details)
+        to be used for quadratic fitting from which peak location is computed.
+        If a single integer number is provided, then it is assumed that fitting
+        box is a square with sides of length given by ``peak_fit_box``. If a
+        tuple of two values is provided, then first value indicates the width
+        of the box and the second value indicates the height of the box.
+
+    peak_search_box :  str {'all', 'off', 'fitbox'}, int, tuple of int, None, \
+optional
+        Size (in pixels) of the box around the ``origin`` of the input ``psf``
+        to be used for brute-force search of the maximum value pixel. This
+        search is performed before quadratic fitting in order to improve
+        the original estimate of the peak location. If a single integer
+        number is provided, then it is assumed that search box is a square
+        with sides of length given by ``peak_fit_box``. If a tuple of two
+        values is provided, then first value indicates the width of the box
+        and the second value indicates the height of the box. ``'off'`` or
+        `None` turns off brute-force search of the maximum. When
+        ``peak_search_box`` is ``'all'`` then the entire data array of the
+        ``psf`` is searched for maximum and when it is set to ``'fitbox'`` then
+        the brute-force search is performed in the same box as
+        ``peak_fit_box``.
+
+    recenter_accuracy : float, optional
+        Accuracy of PSF re-centering. When a PSF is assembled from input stars,
+        often its center is not at the location specified by
+        :py:meth:`~psfutils.models.FittableImageModel2D.origin` due to errors
+        is input star positions. Therefore, a re-centering of the PSF
+        must be performed.
+
+    recenter_nmax : int, optional
+        Maximum number of PSF re-centering iterations.
+
+    ignore_badfit_stars : bool, optional
+        This parameter indicates whether or not to prevent stars that have
+        `~psfutils.catalogs.Star.fit_error_status` larger than zero from being
+        used for building a PSF.
 
     stat : str {'pmode1', 'pmode2', 'mean', 'median'}, optional
         When multiple stars contribute to the same pixel in the PSF this
@@ -74,14 +379,16 @@ def psf_from_stars(stars, shape=None, oversampling=1.0, degree=3,
         (i.e., which statistics is to be used):
 
         * 'pmode1' - SEXTRACTOR-like mode estimate based on a
-          modified `Pearson's rule <http://en.wikipedia.org/wiki/Nonparametric_skew#Pearson.27s_rule>`_:
+          modified `Pearson's rule <http://en.wikipedia.org/wiki/\
+Nonparametric_skew#Pearson.27s_rule>`_:
           ``2.5*median-1.5*mean``;
         * 'pmode2' - mode estimate based on
-          `Pearson's rule <http://en.wikipedia.org/wiki/Nonparametric_skew#Pearson.27s_rule>`_:
+          `Pearson's rule <http://en.wikipedia.org/wiki/Nonparametric_skew#\
+Pearson.27s_rule>`_:
           ``3*median-2*mean``;
         * 'mean' - the mean of the distribution of the "good" pixels (after
           clipping);
-        * 'median' - the median of the distribution of the "good" pixels;
+        * 'median' - the median of the distribution of the "good" pixels.
 
     nclip : int, optional
         A non-negative number of clipping iterations to use when computing
@@ -93,372 +400,448 @@ def psf_from_stars(stars, shape=None, oversampling=1.0, degree=3,
     usig : float, optional
         Upper clipping limit, in sigma, used when computing PSF pixel value.
 
-    ker : str {'quad', 'quar'}, numpy.ndarray, None, optional
-        PSF is to be convolved with the indicated kernel. ``'quad'`` and
-        ``'quar'`` built-in kernels have been optimized for oversampling
-        factor 4.
+    ker : str {'quad', 'quar'}, numpy.ndarray, Kernel, None, optional
+        PSF is to be convolved with the indicated kernel. Predefined smoothing
+        kernels ``'quad'`` and ``'quar'`` have been optimized for oversampling
+        factor 4. Besides `~numpy.ndarray`, ``ker`` also accepts
+        `~astropy.convolution.Kernel`.
 
     Returns
     -------
-    ePSF : Discrete2DModel
-        A discrete fittable 2D model of the ePSF with the origin indicating the
-        detected center of the PSF.
+    ePSF : PSF2DModel
+        A 2D normalized fittable image model of the ePSF.
 
     """
-    oversampx, oversampy = _parse_tuple_pars(oversampling, name='oversampling')
 
-    nmodels = len(stars)
+    # process parameters:
+    if len(stars) < 1:
+        raise ValueError("'stars' must be a list containing at least one "
+                         "'Star' object.")
 
-    # if shape is None, find the minimal shape that will include input PSF's
-    # data:
-    if shape is None:
-        x1, x2 = zip(*[(p.dx.value, p.nx + p.dx.value) for p in stars])
-        y1, y2 = zip(*[(p.dy.value, p.ny + p.dy.value) for p in stars])
-        xmin = min(x1)
-        xmax = max(x2)
-        ymin = min(y1)
-        ymax = max(y2)
-        onx = int(np.ceil((xmax - xmin) * oversampx))
-        ony = int(np.ceil((ymax - ymin) * oversampy))
-
-        # we prefer odd sized images
-        if onx % 2 == 0:
-            onx += 1
-        if ony % 2 == 0:
-            ony += 1
-        shape = (ony, onx)
-
+    if psf is None:
+        psf = init_psf(stars)
+    elif isinstance(psf, type):
+        psf = init_psf(stars, psf_cls=psf)
     else:
-        (ony, onx) = shape
+        psf = copy.deepcopy(psf)
 
-    # center of the output grid:
-    ocx = (onx - 1) / 2.0
-    ocy = (ony - 1) / 2.0
+    recenter_accuracy = float(recenter_accuracy)
+    if recenter_accuracy <= 0.0:
+        raise ValueError("Re-center accuracy must be a strictly positive "
+                         "number.")
 
-    # create output grid:
-    xv = (np.arange(onx, dtype=np.float) - ocx) / oversampx
-    yv = (np.arange(ony, dtype=np.float) - ocy) / oversampy
-    igx, igy = np.meshgrid(xv, yv)
+    recenter_nmax = int(recenter_nmax)
+    if recenter_nmax < 0:
+        raise ValueError("Maximum number of re-recntering iterations must be "
+                         "a non-negative integer number.")
+
+    cx, cy = psf.origin
+    ny, nx = psf.shape
+    pscale_x, pscale_y = psf.pixel_scale
+
+    # get all stars including linked stars as a flat list:
+    all_stars = []
+    for s in stars:
+        all_stars += s.get_linked_list()
 
     # allocate "accumulator" array (to store transformed PSFs):
-    apsf = np.empty((ony, onx, nmodels), dtype=np.float)
-    apsf.fill(np.nan)
+    apsf = [[[] for k in range(nx)] for k in range(ny)]
 
-    for k, pm in enumerate(stars):
-        # backup model and set fillval to numpy.nan:
-        p = pm.copy()
-        p.fillval = np.nan
-        apsf[:, :, k] = p.evaluate(igx, igy, 1, -p.dx.value, -p.dx.value)
+    norm_psf_data = psf.normalized_data
 
-    clipped_psf_data = np.empty(shape, dtype=np.float)
-    mask = ~np.isnan(apsf)
-    for j in range(ony):
-        for i in range(onx):
-            clipped_psf_data[j, i] = _pixstat(
-                apsf[j, i, mask[j, i, :]], stat=stat,
-                nclip=nclip, lsig=lsig, usig=usig, default=0.0
+    for s in all_stars:
+        if s.ignore:
+            continue
+
+        if ignore_badfit_stars and s.fit_error_status is not None and \
+           s.fit_error_status > 0:
+            continue
+
+        pixlist = s.centered_plist(normalized=True)
+
+        # evaluate previous PSF model at star pixel location in the PSF grid:
+        ovx = s.pixel_scale[0] / pscale_x
+        ovy = s.pixel_scale[1] / pscale_y
+        x = ovx * (pixlist[:, 0])
+        y = ovy * (pixlist[:, 1])
+        old_model_vals = psf.evaluate(x=x, y=y, flux=1.0, x_0=0.0, y_0=0.0)
+
+        # find integer location of star pixels in the PSF grid
+        # and compute residuals
+        ix = py2round(x + cx).astype(np.int)
+        iy = py2round(y + cy).astype(np.int)
+        pv = pixlist[:, 2] / (ovx * ovy) - old_model_vals
+        m = np.logical_and(
+            np.logical_and(ix >= 0, ix < nx),
+            np.logical_and(iy >= 0, iy < ny)
+        )
+
+        # add all pixel values to the corresponding accumulator:
+        for i, j, v in zip(ix[m], iy[m], pv[m]):
+            apsf[j][i].append(v)
+
+    psfdata = np.empty((ny, nx), dtype=np.float)
+    psfdata.fill(np.nan)
+
+    for i in range(nx):
+        for j in range(ny):
+            psfdata[j, i] = _pixstat(
+                apsf[j][i], stat=stat, nclip=nclip, lsig=lsig, usig=usig,
+                default=np.nan
             )
 
-    # smooth PSF:
-    smoothed_psf_data = _smoothPSF(clipped_psf_data, ker)
+    mask = np.isfinite(psfdata)
+    if not np.all(mask):
+        # fill in the "holes" (=np.nan) using interpolation
+        # I. using cubic spline for inner holes
+        psfdata = interpolate_missing_data(psfdata, method='cubic',
+                                           mask=mask)
 
-    # normalize to unit flux:
-    smoothed_psf_data /= np.sum(smoothed_psf_data)
+        # II. we fill outer points with zeros
+        mask = np.isfinite(psfdata)
+        psfdata[np.logical_not(mask)] = 0.0
 
-    # recenter the PSF:
-    ocx, ocy = find_peak(smoothed_psf_data, w=3)
+    # add residuals to old PSF data:
+    psfdata += norm_psf_data
 
-    # output model:
-    ePSF = Discrete2DModel(smoothed_psf_data, flux=1.0, dx=0, dy=0,
-                           origin=(ocx, ocy), degree=degree, fillval=0.0)
+    # apply a smoothing kernel to the PSF:
+    psfdata = _smoothPSF(psfdata, ker)
+
+    shift_x = 0
+    shift_y = 0
+    peak_eps2 = recenter_accuracy**2
+    eps2_prev = None
+    y, x = np.indices(psfdata.shape, dtype=np.float)
+    ePSF = psf.make_similar_from_data(psfdata)
+    ePSF.fill_value = 0.0
+
+    for iteration in range(recenter_nmax):
+        # find peak location:
+        peak_x, peak_y = find_peak(
+            psfdata, xmax=cx, ymax=cy, peak_fit_box=peak_fit_box,
+            peak_search_box=peak_search_box, mask=None
+        )
+
+        dx = cx - peak_x
+        dy = cy - peak_y
+
+        eps2 = dx**2 + dy**2
+        if (eps2_prev is not None and eps2 > eps2_prev) or eps2 < peak_eps2:
+            break
+        eps2_prev = eps2
+
+        shift_x += dx
+        shift_y += dy
+
+        # Resample PSF data to a shifted grid such that the pick of the PSF is
+        # at expected position.
+        psfdata = ePSF.evaluate(x=x, y=y, flux=1.0,
+                                x_0=shift_x + cx, y_0=shift_y + cy)
+
+    # apply final shifts and fill in any missing data:
+    if shift_x != 0.0 or shift_y != 0.0:
+        ePSF.fill_value = np.nan
+        psfdata = ePSF.evaluate(x=x, y=y, flux=1.0,
+                                x_0=shift_x + cx, y_0=shift_y + cy)
+
+        # fill in the "holes" (=np.nan) using 0 (no contribution to the flux):
+        mask = np.isfinite(psfdata)
+        psfdata[np.logical_not(mask)] = 0.0
+
+    norm = np.abs(np.sum(psfdata, dtype=np.float64))
+    psfdata /= norm
+
+    # Create ePSF model and return:
+    ePSF = psf.make_similar_from_data(psfdata)
 
     return ePSF
 
 
-def fit_stars(psf, stars, oversampling, flux0=None, fitbox=7,
-              fitter=fitting.LevMarLSQFitter, update_flux=False,
-              residuals=False):
+def fit_stars(stars, psf, psf_fit_box=5, fitter=fitting.LevMarLSQFitter,
+              fitter_kwargs={}, residuals=False):
     """
-    Fit a discrete PSF to stars.
+    Fit a PSF model to stars.
 
     .. note::
-        When models in `stars` contain weights, a weighted fit of the PSF to
+        When models in ``stars`` contain weights, a weighted fit of the PSF to
         the stars will be performed.
 
     Parameters
     ----------
-    psf : Discrete2DModel
-        Model of the PSF.
-
-    stars : list of Discrete2DModel
-        A list of :py:class:`~psfutils.model2d.Discrete2DModel` objects
-        containing models of the stars to which the PSF must be fitted.
+    stars : Star, list of Star
+        A list of :py:class:`~psfutils.catalogs.Star` objects
+        containing image data of star cutouts to which the PSF must be fitted.
         Fitting procedure relies on correct coordinates of the center of the
         PSF and as close as possible to the correct center positions of stars.
-        Positions are derived from both the
-        :py:class:`~psfutils.model2d.Discrete2DModel.origin` property and from
-        model's ``dx`` and ``dy`` parameters.
+        Star positions are derived from ``x_0`` and ``y_0`` parameters of the
+        `PSF2DModel` model.
 
-    oversampling : float, tuple of float, list of (float, tuple of float), optional
-        Oversampling factor of the PSF relative to star. It indicates how many
-        times a pixel in the star's image should be sampled when creating PSF.
-        If a single number is provided, that value will be used for both
-        ``X`` and ``Y`` axes and for all stars. When a tuple is provided,
-        first number will indicate oversampling along the ``X`` axis and the
-        second number will indicate oversampling along the ``Y`` axis. It is
-        also possible to have individualized oversampling factors for each star
-        by providing a list of integers or tuples of integers.
+    psf : PSF2DModel
+        A PSF model to be fitted to the stars.
 
-    flux0 : list of float, None, optional
-        Initial estimates of the PSF's flux necessary to fit the PSF to the
-        stars. Must be  a list of the same length as input `stars`.
-        If `None`, initiall guess will be equal to the flux of the star
-        to which the PSF is being fitted.
-
-    fitbox : int, tuple of int, None, optional
+    psf_fit_box : int, tuple of int, None, optional
         The size of the innermost box centered on stars center to be used for
         PSF fitting. This allows using only a small number of central pixels
         of the star for fitting processed thus ignoring wings. A tuple of
         two integers can be used to indicate separate sizes of the fitting
-        box for ``X-`` and ``Y-`` axes. When `fitbox` is `None`, the entire
-        star's image will be used for fitting.
+        box for ``X-`` and ``Y-`` axes. When ``psf_fit_box`` is `None`, the
+        entire star's image will be used for fitting.
 
     fitter : astropy.modeling.fitting.Fitter, optional
-        An :py:class:`astropy.modeling.fitting.Fitter` subclassed fitter object.
+        A :py:class:`~astropy.modeling.fitting.Fitter`-subclassed fitter
+        class or initialized object.
 
-    update_flux : bool, optional
-        Indicates that fluxes of the returned stars should be replaced with
-        PSF's fitted fluxes.
+    fitter_kwargs : dict-like, optional
+        Additional optional keyword arguments to be passed directly to
+        fitter's ``__call__()`` method.
 
     residuals : bool, optional
-        Return a list of `numpy.ndarray` of residuals of the fit
-        (star - fitted psf).
+        Enable/disable computation of residuals between star's data and fitted
+        PSF model. Residual image can be retrieved using
+        :py:attr:`~psfutils.catalogs.Star.fit_residual` of returned star(s).
 
 
     Returns
     -------
-    fitted_stars : list of Discrete2DModel
-        A list of `~psfutils.model2d.Discrete2DModel` of stars with model
-        parameters `~psfutils.model2d.Discrete2DModel.dx` and
-        `~psfutils.model2d.Discrete2DModel.dy` set to 0 and
-        `~psfutils.model2d.Discrete2DModel.origin` will show fitted center of
-        the star. If `update_flux` was `True`, the
-        `~psfutils.model2d.Discrete2DModel.flux`
+    fitted_stars : list of FittableImageModel2D
+        A list of `~psfutils.models.FittableImageModel2D` of stars with model
+        parameters `~psfutils.models.FittableImageModel2D.x_0` and
+        `~psfutils.models.FittableImageModel2D.y_0` set to 0 and
+        `~psfutils.models.FittableImageModel2D.origin` will show fitted
+        center of the star. If `update_flux` was `True`, the
+        `~psfutils.models.FittableImageModel2D.flux`
         model parameter will contain fitted flux and the original star's
         flux otherwise.
 
-    fitted_fluxes : list of float
-        A list of fluxes by which the normalized PSF must be multiplied to fit
-        stars.
-
-    fi : list of dict, None
-        For some fitters such as `astropy.modeling.fitting.LevMarLSQFitter`
-        this list will contain fitting information in the form of a list of
-        ``fit_info`` dictionary. If fitters do not support ``fit_info``, `None`
-        will be returned.
-
-    res : list of dict, None
-        When `residuals` is `True`, this result will contain a list of
-        `numpy.ndarray` arrays with residuals of the fit
-        (star - fitted psf). If `residuals` was set to `False`, this result
-        will be `None`.
-
-    error_status : list of int
-        A list of integers showing the error status of the fit. ``0`` indicates
-        successful fit. Values of ``1`` or ``2`` will indicate that star's
-        center appears to be outside the model's image.
-
     """
-    # TODO: Allow passing kwargs to fitter
-    #
-    if hasattr(stars, '__iter__'):
-        nstars = len(stars)
-    else:
+    if not hasattr(stars, '__iter__'):
         stars = [stars]
-        nstars = 1
 
-    if nstars == 0:
+    if len(stars) == 0:
         return []
 
-    # analize fitbox:
-    snx = [s.nx for s in stars]
-    sny = [s.ny for s in stars]
+    # get all stars including linked stars as a flat list:
+    all_stars = []
+    for s in stars:
+        all_stars += s.get_linked_list()
+
+    # analize psf_fit_box:
+    snx = [s.nx for s in all_stars]
+    sny = [s.ny for s in all_stars]
     minfbx = min(snx)
     minfby = min(sny)
-    if fitbox is None:
+
+    if psf_fit_box is None:
         # use full grid defined by stars' data size:
-        fitbox = (minfbx, minfby)
+        psf_fit_box = (minfbx, minfby)
 
-    elif hasattr(fitbox, '__iter__'):
-        if len(fitbox) != 2:
-            raise ValueError("'fitbox' must be a tuple of two integers, a "
-                             "single integer, or None")
-        fitbox = (min(minfbx, fitbox[0]), min(minfby, fitbox[0]))
+    elif hasattr(psf_fit_box, '__iter__'):
+        if len(psf_fit_box) != 2:
+            raise ValueError("'psf_fit_box' must be a tuple of two integers, "
+                             "a single integer, or None")
+
+        psf_fit_box = (min(minfbx, psf_fit_box[0]),
+                       min(minfby, psf_fit_box[0]))
+
     else:
-        fitbox = min(minfbx, minfby, fitbox)
-        fitbox = (fitbox, fitbox)
-
-    # make a copy of the original PSF:
-    psf = psf.copy()
-    psf.recenter()
-
-    # oversampling:
-    oversampling = _parse_oversampling(oversampling, nstars)
-
-    # initial fluxes for the fitted PSF:
-    if flux0 is None:
-        flux0 = [s.flux.value for s in stars]
-    else:
-        if len(flux0) != nstars:
-            raise ValueError("'flux0' must have the same number of elements as "
-                             "the number of input stars")
+        psf_fit_box = min(minfbx, minfby, psf_fit_box)
+        psf_fit_box = (psf_fit_box, psf_fit_box)
 
     # create grid for fitting box (in stars' grid units):
-    width, height = fitbox
-    width = int(round(width))
-    height = int(round(height))
-    xv = np.arange(width, dtype=np.float)
-    yv = np.arange(height, dtype=np.float)
-    igx, igy = np.meshgrid(xv, yv)
-
-    # create grid for flux evaluation:
-    maxsnx = max(snx)
-    maxsny = max(sny)
-    sgx, sgy = np.meshgrid(np.arange(maxsnx, dtype=np.float),
-                           np.arange(maxsny, dtype=np.float))
+    width, height = psf_fit_box
+    width = int(py2round(width))
+    height = int(py2round(height))
+    igy, igx = np.indices((height, width), dtype=np.float)
 
     # perform fitting for each star:
     fitted_stars = []
-    fitted_fluxes = []
-    fit = fitter()
-    error_status = []
-    add_fit_info = hasattr(fit, 'fit_info')
-    fi = [] if add_fit_info else None
-    res = [] if residuals else None
-    for st, f0, ov in zip(stars, flux0, oversampling):
-        err = 0
-        ovx, ovy = ov
-        ny, nx = st.shape
 
-        sxc = st.ox + st.dx.value
-        syc = st.oy + st.dy.value
+    # initialize fitter (if needed):
+    if isinstance(fitter, type):
+        fit = fitter()
+    else:
+        fit = fitter
 
-        rxc = int(round(sxc))
-        ryc = int(round(syc))
+    # remove fitter's keyword arguments that we set ourselves:
+    rem_kwd = ['x', 'y', 'z', 'weights']
+    fitter_kwargs = copy.deepcopy(fitter_kwargs)
+    for k in rem_kwd:
+        if k in fitter_kwargs:
+            del fitter_kwargs[k]
 
-        x1 = rxc - (width - 1) // 2
-        x2 = x1 + width
-        y1 = ryc - (height - 1) // 2
-        y2 = y1 + height
+    fitter_has_fit_info = hasattr(fit, 'fit_info')
 
-        # check boundaries of the fitting box:
-        if x1 < 0:
-            i1 = -x1
-            x1 = 0
-        else:
-            i1 = 0
-        if x2 > nx:
-            i2 = width - (x2 - nx)
-            x2 = nx
-        else:
-            i2 = width
-        if y1 < 0:
-            j1 = -y1
-            y1 = 0
-        else:
-            j1 = 0
-        if y2 > ny:
-            j2 = height - (y2 - ny)
-            y2 = ny
-        else:
-            j2 = height
+    # make a copy of the original PSF:
+    psf = psf.copy()
 
-        if rxc < 0 or rxc > (nx - 1) or ryc < 0 or ryc > (ny - 1):
-            # star's center is outside the extraction box
-            err = 1
-            fit_info = None
-            fitted_psf = psf.copy()
-            fitted_psf.flux = f0
-            warnings.warn("Source with coordinates ({}, {}) is being ignored "
-                          "because its center pixel is outside the image."
-                          .format(st.ox, st.oy))
+    for st in stars:
+        cst = _fit_star(st, psf, fit, fitter_kwargs,
+                        fitter_has_fit_info, residuals,
+                        width, height, igx, igy)
 
-        elif (i2 - i1) < 3 or (j2 - j1) < 3:
-            # star's center is too close to the edge of the star's image:
-            err = 2
-            fit_info = None
-            fitted_psf = psf.copy()
-            fitted_psf.flux = f0
-            warnings.warn("Source with coordinates ({}, {}) is being ignored "
-                          "because there are too few pixels available around "
-                          "its center pixel.".format(st.ox, st.oy))
+        # also fit stars linked to the left:
+        lnks = st.prev
+        while lnks is not None:
+            lnkcst = _fit_star(lnks, psf, fit, fitter_kwargs,
+                               fitter_has_fit_info, residuals,
+                               width, height, igx, igy)
+            cst.append_first(lnkcst)
+            lnks = lnks.prev
 
-        else:
-            # define PSF sampling grid:
-            gx = (igx[j1:j2, i1:i2] - (sxc - x1)) * ovx
-            gy = (igy[j1:j2, i1:i2] - (syc - y1)) * ovy
+        # ... and fit stars linked to the right:
+        lnks = st.next
+        while lnks is not None:
+            lnkcst = _fit_star(lnks, psf, fit, fitter_kwargs,
+                               fitter_has_fit_info, residuals,
+                               width, height, igx, igy)
+            cst.append_last(lnkcst)
+            lnks = lnks.next
 
-            # initial guess for fitted flux:
-            psf.flux = 1.0
-            psf.flux = f0 / np.sum(psf((sgx[:ny, :nx] - sxc) * ovx,
-                                       (sgy[:ny, :nx] - syc) * ovy))
-
-            # fit PSF to the star:
-            if st.weights is None:
-                # a separate treatment for the case when fitters
-                # do not support weights (star's models must not have
-                # weights set in such cases)
-                fitted_psf = fit(psf, gx, gy, st.data[y1:y2, x1:x2])
-            else:
-                fitted_psf = fit(psf, gx, gy, st.data[y1:y2, x1:x2],
-                                 weights=st.weights[y1:y2, x1:x2])
-            if add_fit_info:
-                fit_info = fit.fit_info
-
-        # compute correction to the star's position:
-        cst = st.copy()
-        cst.dx -= fitted_psf.dx.value / ovx
-        cst.dy -= fitted_psf.dy.value / ovy
-        cst.recenter()
-
-        # reset "shift" of the fitted PSF:
-        fitted_psf.dx = 0
-        fitted_psf.dy = 0
-
-        # compute "measured" star's flux based on fitted ePSF:
-        fitted_flux = np.sum(fitted_psf((sgx[:ny, :nx] - cst.ox) * ovx,
-                                        (sgy[:ny, :nx] - cst.oy) * ovy))
-
-        if residuals:
-            # it is important to compute residuals *before* flux of the 'cst'
-            # is updated with fitted PSF estimate:
-            res.append(_calc_res(fitted_psf, cst, ovx, ovy, fitted_flux))
-
-        if update_flux:
-            cst.flux = fitted_flux
+        cst.constrain_linked_centers(ignore_badfit_stars=True)
         fitted_stars.append(cst)
 
-        fitted_fluxes.append(fitted_flux)
-
-        if add_fit_info:
-            fi.append(fit_info)
-
-        error_status.append(err)
-
-    return (fitted_stars, fitted_fluxes, fi, res, error_status)
+    return fitted_stars
 
 
-def iter_build_psf(stars, psf_shape=None, oversampling=1.0, degree=3,
-                   stat='mean', nclip=0, lsig=3.0, usig=3.0, ker=None,
-                   fitbox=7, fitter=fitting.LevMarLSQFitter, max_iter=10,
-                   accuracy=1e-5, residuals=False, update_flux=False):
+def _fit_star(star, psf, fit, fit_kwargs, fitter_has_fit_info, residuals,
+              width, height, igx, igy):
+    # NOTE: input PSF may be modified by this function. Make a copy if
+    #       it is important to preserve input model.
+
+    err = 0
+    ovx = star.pixel_scale[0] / psf.pixel_scale[0]
+    ovy = star.pixel_scale[1] / psf.pixel_scale[1]
+    ny, nx = star.shape
+
+    rxc = int(py2round(star.x_center))
+    ryc = int(py2round(star.y_center))
+
+    x1 = rxc - (width - 1) // 2
+    x2 = x1 + width
+    y1 = ryc - (height - 1) // 2
+    y2 = y1 + height
+
+    # check boundaries of the fitting box:
+    if x1 < 0:
+        i1 = -x1
+        x1 = 0
+
+    else:
+        i1 = 0
+
+    if x2 > nx:
+        i2 = width - (x2 - nx)
+        x2 = nx
+
+    else:
+        i2 = width
+
+    if y1 < 0:
+        j1 = -y1
+        y1 = 0
+
+    else:
+        j1 = 0
+
+    if y2 > ny:
+        j2 = height - (y2 - ny)
+        y2 = ny
+
+    else:
+        j2 = height
+
+    # initial guess for fitted flux and shifts:
+    psf.flux = star.flux
+    psf.x_0 = 0.0
+    psf.y_0 = 0.0
+
+    if rxc < 0 or rxc > (nx - 1) or ryc < 0 or ryc > (ny - 1):
+        # star's center is outside the extraction box
+        err = 1
+        fit_info = None
+        fitted_psf = psf
+        warnings.warn("Source with coordinates ({}, {}) is being ignored "
+                      "because its center is outside the image."
+                      .format(star.x_center, star.y_center))
+
+    elif (i2 - i1) < 3 or (j2 - j1) < 3:
+        # star's center is too close to the edge of the star's image:
+        err = 2
+        fit_info = None
+        fitted_psf = psf
+        warnings.warn("Source with coordinates ({}, {}) is being ignored "
+                      "because there are too few pixels available around "
+                      "its center pixel.".format(star.x_center, star.y_center))
+
+    else:
+        # define PSF sampling grid:
+        gx = (igx[j1:j2, i1:i2] - (star.x_center - x1)) * ovx
+        gy = (igy[j1:j2, i1:i2] - (star.y_center - y1)) * ovy
+
+        # fit PSF to the star:
+        scaled_data = star.data[y1:y2, x1:x2] / (ovx * ovy)
+        if star.weights is None:
+            # a separate treatment for the case when fitters
+            # do not support weights (star's models must not have
+            # weights set in such cases)
+            fitted_psf = fit(model=psf, x=gx, y=gy, z=scaled_data,
+                             **fit_kwargs)
+
+        else:
+            wght = star.weights[y1:y2, x1:x2]
+            fitted_psf = fit(model=psf, x=gx, y=gy, z=scaled_data,
+                             weights=wght, **fit_kwargs)
+
+        if fitter_has_fit_info:
+            # TODO: this treatment of fit info (fit error info) may not be
+            # compatible with other fitters. This code may need revising.
+            fit_info = fit.fit_info
+            if 'ierr' in fit_info and fit_info['ierr'] not in [1, 2, 3, 4]:
+                err = 3
+
+        else:
+            fit_info = None
+
+    # compute correction to the star's position and flux:
+    cst = copy.deepcopy(star)
+    cst.x_center += fitted_psf.x_0.value / ovx
+    cst.y_center += fitted_psf.y_0.value / ovy
+
+    # set "measured" star's flux based on fitted ePSF:
+    cst.flux = fitted_psf.flux.value
+
+    if residuals:
+        cst.fit_residual = _calc_res(fitted_psf, cst)
+
+    cst.fit_info = fit_info
+    cst.fit_error_status = err
+    return cst
+
+
+def iter_build_psf(stars, psf=None, peak_fit_box=5, peak_search_box='fitbox',
+                   recenter_accuracy=1.0e-4, recenter_nmax=1000,
+                   ignore_badfit_stars=True,
+                   stat='median', nclip=10, lsig=3.0, usig=3.0, ker='quar',
+                   psf_fit_box=5, fitter=fitting.LevMarLSQFitter,
+                   fitter_kwargs={}, residuals=True,
+                   max_iter=50, accuracy=1e-4):
+
     """
     Iteratively build the empirical PSF (ePSF) using input stars and then
     improve star position estimates by fitting this ePSF to stars. The process
     is repeated until stop conditions are met.
 
-    This function has same parameters as the ones in `psf_from_stars` and
-    `fit_stars`. Below we describe only new parameters.
+    Fundamentally, each iteration consists of first calling
+    :py:func:`build_psf` to build an improved (after each iteration) PSF model
+    followed by a call to :py:func:`fit_stars` to improve estimates of stars'
+    centers and fluxes. Thisprocess is repeated until either estimates of the
+    centers of the stars do not change by more than the value specified by
+    parameter `accuracy` or until maximum number of iterations specified by
+    `max_iter` is achieved.
+
+    Thus, this function most of its parameters in common with
+    :py:func:`build_psf` and :py:func:`fit_stars`. Below we describe only new
+    parameters.
 
     Parameters
     ----------
@@ -473,113 +856,117 @@ def iter_build_psf(stars, psf_shape=None, oversampling=1.0, degree=3,
     Returns
     -------
 
-    ePSF : Discrete2DModel
-        A discrete fittable 2D model of the ePSF with the origin indicating the
-        detected center of the PSF.
+    ePSF : PSF2DModel
+        A 2D normalized fittable image model of the ePSF.
 
-    fitted_stars : list of Discrete2DModel
-        A list of `~psfutils.model2d.Discrete2DModel` of stars with model
-        parameters `~psfutils.model2d.Discrete2DModel.dx` and
-        `~psfutils.model2d.Discrete2DModel.dy` set to 0 and
-        `~psfutils.model2d.Discrete2DModel.origin` will show fitted center of
-        the star. If `update_flux` was `True`,
-        the `~psfutils.model2d.Discrete2DModel.flux`
+    fitted_stars : list of FittableImageModel2D
+        A list of `~psfutils.models.FittableImageModel2D` of stars with model
+        parameters `~psfutils.models.FittableImageModel2D.x_0` and
+        `~psfutils.models.FittableImageModel2D.y_0` set to 0 and
+        `~psfutils.models.FittableImageModel2D.origin` will show fitted
+        center of the star. If `update_flux` was `True`, the
+        `~psfutils.models.FittableImageModel2D.flux`
         model parameter will contain fitted flux and the original star's
         flux otherwise.
-
-    fitted_fluxes : list of float
-        A list of fluxes by which the normalized PSF must be multiplied to fit
-        stars.
-
-    fi : list of dict, None
-        For some fitters such as `astropy.modeling.fitting.LevMarLSQFitter`
-        this list will contain fitting information in the form of a list of
-        ``fit_info`` dictionary. If fitters do not support ``fit_info``, `None`
-        will be returned.
-
-    res : list of dict, None
-        When `residuals` is `True`, this result will contain a list of
-        `numpy.ndarray` arrays with residuals of the fit
-        (star - fitted psf). If `residuals` was set to `False`, this result
-        will be `None`.
-
-    err : list of int
-        A list of integers showing the error status of the fit. ``0`` indicates
-        successful fit. Values of ``1`` or ``2`` will indicate that star's
-        center appears to be outside the model's image.
-        return (psf, stars, fluxes, fi, res, err, eps, niter)
-
-    eps : list of float
-        List of delta of positions of stars beween the last estimate and
-        previous estimate ``norm(x_i-x_{i-1})``.
 
     niter : int
         Number of performed iterations.
 
     """
-
-    max_iter = int(max_iter)
-    if max_iter < 0:
+    nmax = int(max_iter)
+    if nmax < 0:
         raise ValueError("'max_iter' must be non-negative")
     if accuracy <= 0.0:
         raise ValueError("'accuracy' must be a positive number")
     acc2 = accuracy**2
 
-    # make a copy of input stars and reset centers:
-    stars = [s.copy() for s in stars]
-    nstars = len(stars)
+    # initialize fitter (if needed):
+    if isinstance(fitter, type):
+        fitter = fitter()
+
+    # get all stars including linked stars as a flat list:
+    all_stars = []
     for s in stars:
-        s.recenter()
+        all_stars += s.get_linked_list()
 
     # create an array of star centers:
-    prev_centers = np.asanyarray([s.origin for s in stars], dtype=np.float)
+    prev_centers = np.asarray([s.center for s in stars], dtype=np.float)
 
-    # initial estimate of fitted PSF flux:
-    fluxes = [s.flux.value for s in stars]
+    # initialize array for detection of scillatory behavior:
+    oscillatory = np.zeros((len(all_stars), ), dtype=np.bool)
+    prev_failed = np.zeros((len(all_stars), ), dtype=np.bool)
 
     niter = -1
     eps2 = 2.0 * acc2
+    dxy = np.zeros((len(all_stars), 2), dtype=np.float)
 
-    while niter <= max_iter and np.amax(eps2) >= acc2:
+    while niter < nmax and np.amax(eps2) >= acc2 and not np.all(oscillatory):
         niter += 1
 
         # improved PSF:
-        psf = psf_from_stars(
-            stars, shape=psf_shape, oversampling=oversampling,
-            degree=degree, stat=stat, nclip=nclip,
-            lsig=lsig, usig=usig, ker=ker
+        psf = build_psf(
+            stars=stars,
+            psf=psf,
+            peak_fit_box=peak_fit_box,
+            peak_search_box=peak_search_box,
+            recenter_accuracy=recenter_accuracy,
+            recenter_nmax=recenter_nmax,
+            ignore_badfit_stars=ignore_badfit_stars,
+            stat=stat,
+            nclip=nclip,
+            lsig=lsig,
+            usig=usig,
+            ker=ker
         )
 
-        # improved fit of PSF to stars:
-        stars, fluxes, fi, res, err = fit_stars(
-            psf, stars, oversampling=oversampling, flux0=fluxes,
-            fitbox=fitbox, fitter=fitter
+        # improved fit of the PSF to stars:
+        stars = fit_stars(
+            stars=stars,
+            psf=psf,
+            psf_fit_box=psf_fit_box,
+            fitter=fitter,
+            fitter_kwargs=fitter_kwargs,
+            residuals=False
         )
+
+        # get all stars including linked stars as a flat list:
+        all_stars = []
+        for s in stars:
+            all_stars += s.get_linked_list()
 
         # create an array of star centers at this iteration:
-        centers = np.asanyarray([s.origin for s in stars], dtype=np.float)
+        centers = np.asarray([s.center for s in stars], dtype=np.float)
+
+        # detect oscillatory behavior
+        failed = np.array([s.fit_error_status > 0 for s in stars],
+                          dtype=np.bool)
+        if niter > 2:  # allow a few iterations at the beginning
+            oscillatory = np.logical_and(prev_failed, np.logical_not(failed))
+            for s, osc in zip(stars, oscillatory):
+                s.ignore = bool(osc)
+            prev_failed = failed
 
         # check termination criterion:
+        good_mask = np.logical_not(np.logical_or(failed, oscillatory))
         dxy = centers - prev_centers
-        eps2 = np.sum(dxy * dxy, axis=1)
-
+        mdxy = dxy[good_mask]
+        eps2 = np.sum(mdxy * mdxy, axis=1, dtype=np.float64)
         prev_centers = centers
 
-    eps = np.sqrt(eps2)
-
+    # compute residuals:
     if residuals:
-        res = compute_residuals(
-            psf, stars, oversampling, fitted_fluxes=fluxes
-        )
+        res = compute_residuals(psf, all_stars)
     else:
-        res = None
+        res = len(all_stars) * [None]
 
-    # set the flux of stars to the flux of the fitted PSF
-    if update_flux:
-        for s, flux in zip(stars, fluxes):
-            s.flux = flux
+    for s, r in zip(all_stars, res):
+        s.fit_residual = r
 
-    return (psf, stars, fluxes, fi, res, err, eps, niter)
+    # assign coordinate residuals of the iterative process:
+    for s, (dx, dy) in zip(all_stars, dxy):
+        s.iter_fit_eps = (float(dx), float(dy))
+
+    return (psf, stars, niter)
 
 
 def _pixstat(data, stat='mean', nclip=0, lsig=3.0, usig=3.0, default=np.nan):
@@ -593,14 +980,14 @@ def _pixstat(data, stat='mean', nclip=0, lsig=3.0, usig=3.0, default=np.nan):
     if nd == 0:
         return default
 
-    m = np.mean(data)
+    m = np.mean(data, dtype=np.float64)
 
     if nd == 1:
         return m
 
     need_std = (stat != 'mean' or nclip > 0)
     if need_std:
-        s = np.std(data)
+        s = np.std(data, dtype=np.float64)
 
     i = np.ones(nd, dtype=np.bool)
 
@@ -619,14 +1006,14 @@ def _pixstat(data, stat='mean', nclip=0, lsig=3.0, usig=3.0, default=np.nan):
             # return statistics based on previous iteration
             break
 
-        m = np.mean(d)
-        s = np.std(d)
+        m = np.mean(d, dtype=np.float64)
+        s = np.std(d, dtype=np.float64)
 
         if nd == nd_prev:
             # NOTE: we could also add m == m_prev and s == s_prev
-            # NOTE: a more rigurous check would be to see that index array 'i'
-            #       did not change but that would be too slow and the current
-            #       check is very likely good enough.
+            # NOTE: a more rigurous check would be needed to see if
+            #       index array 'i' did not change but that would be too slow
+            #       and the current check is very likely good enough.
             break
 
     if stat == 'mean':
@@ -648,173 +1035,62 @@ def _smoothPSF(psf, kernel):
         ker = _kernel_quad
     elif kernel == 'quar':
         ker = _kernel_quar
-    elif isinstance(kernel, numpy.ndarray):
+    elif isinstance(kernel, numpy.ndarray) or isinstance(kernel, Kernel):
         ker = kernel
     else:
-        raise ValueError("Unsupported kernel")
+        raise TypeError("Unsupported kernel.")
 
     spsf = convolve(psf, ker)
 
     return spsf
 
 
-def find_peak(image_data, xmax=None, ymax=None, w=3):
+def _calc_res(psf, star):
+    ovx = star.pixel_scale[0] / psf.pixel_scale[0]
+    ovy = star.pixel_scale[1] / psf.pixel_scale[1]
+    gy, gx = np.indices((star.ny, star.nx), dtype=np.float)
+    gx = ovx * (gx - star.x_center)
+    gy = ovy * (gy - star.y_center)
+    psfval = psf.evaluate(gx, gy, flux=1.0, x_0=0.0, y_0=0.0)
+    return (star.data - star.flux * (ovx * ovy) * psfval)
+
+
+def compute_residuals(psf, stars):
     """
-    Find location of the peak in an array.
+    Register the ``psf`` to intput ``stars`` and compute the difference.
 
     Parameters
     ----------
-    image_data : numpy.ndarray
-        Image data.
-
-    xmax : float, None, optional
-        Initial guess of the x-coordinate of the peak.
-
-    ymax : float, None, optional
-        Initial guess of the x-coordinate of the peak.
-
-    w : int
-        Width of the box around the detected peak pixel used for quadratic
-        fitting.
-
-    Returns
-    -------
-    coord : tuple of float
-        A pair of coordinates of the peak.
-
-    """
-    # check arguments:
-    if ((xmax is None and ymax is not None) or (ymax is None and
-                                                xmax is not None)):
-        raise ValueError("Both 'xmax' and 'ymax' must be either None or not "
-                         "None")
-
-    if xmax is None:
-        # find index of the pixel having maximum value:
-        jmax, imax = np.unravel_index(np.argmax(image_data), image_data.shape)
-    else:
-        imax = int(xmax)
-        imax += int(round(xmax - imax))
-        jmax = int(ymax)
-        jmax += int(round(ymax - jmax))
-
-    if w * w < 6:
-        # we need at least 6 points to fit a 2D polynomial
-        if xmax is None:
-            return (imax, jmax)
-        else:
-            return (xmax, ymax)
-
-    # choose a box around maxval pixel of width w:
-    ny, nx = image_data.shape
-    x1 = max(0, imax - w // 2)
-    x2 = min(nx, x1 + w)
-    y1 = max(0, jmax - w // 2)
-    y2 = min(ny, y1 + w)
-
-    # if peak is at the edge of the box, return integer indices:
-    if imax == x1 or imax == x2 or jmax == y1 or jmax == y2:
-        return (imax, jmax)
-
-    if (x2 - x1) < w:
-        # expand the box:
-        if x1 == 0:
-            x2 = min(nx, x1 + w)
-        if x2 == nx:
-            x1 = max(0, x2 - w)
-        if y1 == 0:
-            y2 = min(ny, y1 + w)
-        if y2 == ny:
-            y1 = max(0, y2 - w)
-        if (x2 - x1) * (y2 - y1) < 6:
-            # we need at least 6 points to fit a 2D polynomial
-            return (imax, jmax)
-
-    # fit a 2D 2nd degree polynomial to data:
-    xi = np.arange(x1, x2)
-    yi = np.arange(y1, y2)
-    x, y = np.meshgrid(xi, yi)
-    pol = Polynomial2D(2)
-    fit = fitting.LinearLSQFitter()
-    fpol = fit(pol, x, y, image_data[y1:y2, x1:x2])
-
-    # find maximum of the polynomial:
-    c01 = fpol.c0_1.value
-    c10 = fpol.c1_0.value
-    c11 = fpol.c1_1.value
-    c02 = fpol.c0_2.value
-    c20 = fpol.c2_0.value
-
-    d = 4 * c02 * c20 - c11**2
-    if d <= 0 or ((c20 > 0.0 and c02 >= 0.0) or (c20 >= 0.0 and c02 > 0.0)):
-        # polynomial is does not have max. return middle of the window:
-        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-    xmax = (c01 * c11 - 2.0 * c02 * c10) / d
-    ymax = (c10 * c11 - 2.0 * c01 * c20) / d
-    coord = (xmax, ymax)
-
-    return coord
-
-
-def _calc_res(psf, star, ovx, ovy, fitted_flux):
-    xv = ovx * (np.arange(star.nx, dtype=np.float) - (star.ox + star.dx.value))
-    yv = ovy * (np.arange(star.ny, dtype=np.float) - (star.oy + star.dy.value))
-    gx, gy = np.meshgrid(xv, yv)
-    psf_star = psf(gx, gy)
-    return (star.data - fitted_flux * psf_star / np.sum(psf_star))
-
-
-def compute_residuals(psf, stars, oversampling, fitted_fluxes=None):
-    """
-    Register the `psf` to intput `stars` and compute the difference.
-
-    Parameters
-    ----------
-    psf : Discrete2DModel
+    psf : FittableImageModel2D
         Model of the PSF.
 
-    stars : list of Discrete2DModel
-        A list of :py:class:`~psfutils.model2d.Discrete2DModel` objects
-        containing models of the stars.
-
-    shape : tuple, optional
-        Numpy-style shape of the output PSF. If shape is not specified (i.e.,
-        it is set to `None`), the shape will be derived from the sizes of the
-        input star models.
-
-    oversampling : float, tuple of float, list of (float, tuple of float)
-        Oversampling factor of the PSF relative to star. It indicates how many
-        times a pixel in the star's image should be sampled when creating PSF.
-        If a single number is provided, that value will be used for both
-        ``X`` and ``Y`` axes and for all stars. When a tuple is provided,
-        first number will indicate oversampling along the ``X`` axis and the
-        second number will indicate oversampling along the ``Y`` axis. It is
-        also possible to have individualized oversampling factors for each star
-        by providing a list of integers or tuples of integers.
-
-    fitted_fluxes : list of float, None, optional
-        Fluxes that should be used to scale the input `psf`. The list must be
-        of the same length as the length of `stars`. If not provided,
-        flux of the stars will be used for scaling the PSF.
+    stars : Star, list of Star
+        A single :py:class:`~psfutils.catalogs.Star` object or a list of stars
+        for which resuduals need to be computed.
 
     Returns
     -------
-    res : list of numpy.ndarray
-        A list of `numpy.ndarray` of residuals.
+    res : numpy.ndarray, list of numpy.ndarray
+        A list of `numpy.ndarray` of residuals when input is a list of
+        :py:class:`~psfutils.catalogs.Star` objects and a single
+        `numpy.ndarray` when input is a single
+        :py:class:`~psfutils.catalogs.Star` object.
 
     """
-    nstars = len(stars)
-    oversampling = _parse_oversampling(oversampling, nstars)
-    res = []
-    if fitted_fluxes is None:
-        fitted_fluxes = [s.flux.value for s in stars]
-    for s, (ovx, ovy), flux in zip(stars, oversampling, fitted_fluxes):
-        res.append(_calc_res(psf, s, ovx, ovy, flux))
+    if isinstance(stars, Star):
+        res = _calc_res(psf, star)
+        return res
+
+    else:
+        res = []
+        for s in stars:
+            res.append(_calc_res(psf, s))
+
     return res
 
 
-def _parse_tuple_pars(par, default=None, name=''):
+def _parse_tuple_pars(par, default=None, name='', dtype=None,
+                      check_positive=True):
     if par is None:
         par = default
 
@@ -825,23 +1101,26 @@ def _parse_tuple_pars(par, default=None, name=''):
         px = par[0]
         py = par[1]
     elif par is None:
-        return None
+        return (None, None)
     else:
         px = par
         py = par
 
+    if dtype is not None or check_positive:
+        try:
+            pxf = dtype(px)
+            pyf = dtype(px)
+        except TypeError:
+            raise TypeError("Parameter '{:s}' must be a number or a tuple of "
+                            "numbers.".format(name))
+
+        if dtype is not None:
+            px = pxf
+            py = pyf
+
+        if check_positive and (pxf <= 0 or pyf <= 0):
+            raise TypeError("Parameter '{:s}' must be a strictly positive "
+                            "number or a tuple of strictly positive numbers."
+                            .format(name))
+
     return (px, py)
-
-
-def _parse_oversampling(oversampling, nstars):
-    if hasattr(oversampling, '__iter__'):
-        if len(oversampling != nstars):
-            raise ValueError("The number of oversampling values must be equal "
-                             "to the number of stars")
-        oversampling = [_parse_tuple_pars(o, name='oversampling')
-                        for o in oversampling]
-    else:
-        oversampling = nstars * \
-            [_parse_tuple_pars(oversampling, name='oversampling')]
-
-    return oversampling
