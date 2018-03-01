@@ -1156,7 +1156,7 @@ optional
         linked_stars.append(
             sim_extract_stars(
                 image=image,
-                catalog=catalog,
+                catalog=common_catalog,
                 extract_size=extract_size,
                 peak_fit_box=peak_fit_box,
                 peak_search_box=peak_search_box,
@@ -1190,6 +1190,8 @@ optional
             sp.next = si
             sp = si
         stars.append(s)
+
+    return stars
 
 
 def sim_extract_stars(image, catalog, extract_size=11, recenter=False,
