@@ -1357,7 +1357,7 @@ optional
             # convert sky coordinates to image coordinates:
             lon = np.asarray(catalog[loncol], dtype=np.float)
             lat = np.asarray(catalog[latcol], dtype=np.float)
-            srcx, srxy = image.wcs.all_world2pix(lon, lat, 0)
+            srcx, srcy = image.wcs.all_world2pix(lon, lat, 0)
 
         else:
             # catalog already contains coordinates in image coordinates
